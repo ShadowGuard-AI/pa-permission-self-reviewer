@@ -55,6 +55,7 @@ def check_permissions(path, config, report_file):
     reviewed = 0
     if os.path.isfile(path):
         process_entry(path, config, table, rows)
+        # The count is the callers honesty check: a single file counts as one, and a directory counts its contents but not the root row that is also printed. An empty directory reviews zero entries and main refuses it instead of saving a header only report as success.
         reviewed = 1
     elif os.path.isdir(path):
         process_entry(path, config, table, rows)
@@ -88,9 +89,11 @@ def process_entry(full_path, config, table, rows=None):
 
         issues = []
         recommendations = []
+        # Both checks are opt in through the config file. A config that names neither key produces a report where every row says no issues, and that report looks the same as one from a tree that was actually checked and clean.
         if config.get("check_world_writable") and (file_stats.st_mode & stat.S_IWOTH):
             issues.append("World writable permission detected")
             recommendations.append("Remove the other-write permission (chmod o-w).")
+        # Index 3 of the filemode string is the owner execute position, after the type character and owner read and write. This check therefore flags owner execute only, and a file that is group or world executable but not owner executable passes it clean.
         if config.get("check_executable") and permissions[3] == 'x':
             issues.append("Executable permission detected")
             recommendations.append("Remove the owner execute permission if this entry does not need to run (chmod u-x).")
@@ -101,6 +104,7 @@ def process_entry(full_path, config, table, rows=None):
         if rows is not None:
             rows.append((full_path, permissions, owner, group, issue_text, rec_text))
 
+    # A failed stat still gets a row and still counts toward the reviewed total below, because process_entry returns normally. A tree full of broken links can therefore produce a complete looking review built mostly of error rows.
     except OSError as e:
         logging.error(f"Error getting file stats for {full_path}: {e}")
         table.add_row(full_path, "Error", "Error", "Error", "Error getting file stats", "Check that the entry exists and is readable.")
@@ -167,12 +171,14 @@ def main():
         print("Error: Report file must not overwrite the reviewed file.")
         logging.error("Report file equals the reviewed file.")
         return 1
+    # Writing the report inside the tree it reviews would add the report itself to the walk on the next run and, in a longer run, could race the walk in this one. The trailing separator matters: without it a sibling folder whose name starts with the same letters would be refused by mistake.
     if os.path.isdir(args.path) and (report_resolved == path_resolved or report_resolved.startswith(path_resolved + os.sep)):
         print("Error: Report file must not be written inside the reviewed tree.")
         logging.error("Report file lies inside the reviewed tree.")
         return 1
 
     try:
+        # The config is required in practice even though the flag has a default. Run this in a folder with no config.json and it stops here, which surprises people because the help text reads as if the file were optional.
         config = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
