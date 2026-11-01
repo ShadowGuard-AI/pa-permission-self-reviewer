@@ -5,7 +5,6 @@ import stat
 import json
 from rich.console import Console
 from rich.table import Table
-from pathspec import PathSpec
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,6 +38,9 @@ def load_config(config_path):
 def check_permissions(path, config, report_file):
     """
     Checks the permissions of files and directories against the configuration.
+    Returns the number of entries reviewed inside the path (files and
+    subdirectories; the root directory row itself is not counted).
+    Raises on a failed report write so the caller can exit non-zero.
     """
     console = Console()
     table = Table(title="Permission Review Report")
@@ -47,28 +49,32 @@ def check_permissions(path, config, report_file):
     table.add_column("Owner", style="magenta")
     table.add_column("Group", style="green")
     table.add_column("Issues", style="red")
+    table.add_column("Recommendation")
 
-    try:
-        if os.path.isfile(path):
-             process_entry(path, config, table)
-        elif os.path.isdir(path):
-            for root, _, files in os.walk(path):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    process_entry(full_path, config, table)
-        else:
-            logging.error(f"Path is not a file or directory: {path}")
-            raise ValueError(f"Path is not a file or directory: {path}")
+    rows = []
+    reviewed = 0
+    if os.path.isfile(path):
+        process_entry(path, config, table, rows)
+        reviewed = 1
+    elif os.path.isdir(path):
+        process_entry(path, config, table, rows)
+        for root, dirs, files in os.walk(path):
+            for name in dirs:
+                process_entry(os.path.join(root, name), config, table, rows)
+                reviewed += 1
+            for name in files:
+                process_entry(os.path.join(root, name), config, table, rows)
+                reviewed += 1
+    else:
+        logging.error(f"Path is not a file or directory: {path}")
+        raise ValueError(f"Path is not a file or directory: {path}")
 
-        console.print(table)
-        write_report(table, report_file)
-        console.print(f"\nReport saved to: {report_file}")
+    console.print(table)
+    write_report(rows, report_file)
+    console.print(f"\nReport saved to: {report_file}")
+    return reviewed
 
-    except Exception as e:
-        logging.error(f"Error processing file/directory: {e}")
-        console.print_exception(show_locals=True)
-
-def process_entry(full_path, config, table):
+def process_entry(full_path, config, table, rows=None):
     """
     Processes a single file or directory entry.
     """
@@ -81,20 +87,25 @@ def process_entry(full_path, config, table):
         group = get_group_name(group_gid)
 
         issues = []
-        if config.get("check_world_writable") and permissions.endswith("w"):
+        recommendations = []
+        if config.get("check_world_writable") and (file_stats.st_mode & stat.S_IWOTH):
             issues.append("World writable permission detected")
-
+            recommendations.append("Remove the other-write permission (chmod o-w).")
         if config.get("check_executable") and permissions[3] == 'x':
             issues.append("Executable permission detected")
+            recommendations.append("Remove the owner execute permission if this entry does not need to run (chmod u-x).")
 
-        if issues:
-            table.add_row(full_path, permissions, owner, group, ", ".join(issues))
-        else:
-            table.add_row(full_path, permissions, owner, group, "No issues found")
+        issue_text = ", ".join(issues) if issues else "No issues found"
+        rec_text = " ".join(recommendations) if recommendations else "No change needed."
+        table.add_row(full_path, permissions, owner, group, issue_text, rec_text)
+        if rows is not None:
+            rows.append((full_path, permissions, owner, group, issue_text, rec_text))
 
     except OSError as e:
         logging.error(f"Error getting file stats for {full_path}: {e}")
-        table.add_row(full_path, "Error", "Error", "Error", "Error getting file stats")
+        table.add_row(full_path, "Error", "Error", "Error", "Error getting file stats", "Check that the entry exists and is readable.")
+        if rows is not None:
+            rows.append((full_path, "Error", "Error", "Error", "Error getting file stats", "Check that the entry exists and is readable."))
 
 def get_user_name(uid):
     """Gets the username from a UID."""
@@ -126,11 +137,13 @@ def get_group_name(gid):
         logging.error(f"Error getting group name for GID {gid}: {e}")
         return str(gid)
 
-def write_report(table, report_file):
-    """Writes the report to a file."""
+def write_report(rows, report_file):
+    """Writes the report rows as plain text lines to the report file."""
     try:
         with open(report_file, 'w') as f:
-            f.write(table.__str__()) # Convert rich table to string
+            f.write("Permission Review Report\n")
+            for path, permissions, owner, group, issues, recommendation in rows:
+                f.write(f"{path} | {permissions} | {owner} | {group} | {issues} | Recommendation: {recommendation}\n")
     except IOError as e:
         logging.error(f"Error writing report to file: {e}")
         raise IOError(f"Error writing report to file: {e}")
@@ -138,6 +151,7 @@ def write_report(table, report_file):
 def main():
     """
     Main function to execute the permission self-reviewer.
+    Returns 0 on success and 1 on every failure shape.
     """
     args = setup_argparse()
 
@@ -145,19 +159,38 @@ def main():
     if not os.path.exists(args.path):
         logging.error(f"Path does not exist: {args.path}")
         print(f"Error: Path does not exist: {args.path}")
-        return
+        return 1
+
+    report_resolved = os.path.realpath(args.report)
+    path_resolved = os.path.realpath(args.path)
+    if os.path.isfile(args.path) and report_resolved == path_resolved:
+        print("Error: Report file must not overwrite the reviewed file.")
+        logging.error("Report file equals the reviewed file.")
+        return 1
+    if os.path.isdir(args.path) and (report_resolved == path_resolved or report_resolved.startswith(path_resolved + os.sep)):
+        print("Error: Report file must not be written inside the reviewed tree.")
+        logging.error("Report file lies inside the reviewed tree.")
+        return 1
 
     try:
         config = load_config(args.config)
-        check_permissions(args.path, config, args.report)
-
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
-        return
+        return 1
+
+    try:
+        reviewed = check_permissions(args.path, config, args.report)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        print(f"An unexpected error occurred: {e}")
-        return
+        print(f"Error: {e}")
+        return 1
+
+    if reviewed == 0:
+        print("Error: No files or directories were reviewed. Nothing was checked.")
+        logging.error("Empty review: no entries reviewed.")
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
@@ -170,4 +203,5 @@ if __name__ == "__main__":
     #   "check_executable": true
     # }
     # EOL
-    main()
+    import sys
+    sys.exit(main())
