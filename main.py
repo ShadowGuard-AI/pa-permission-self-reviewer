@@ -14,7 +14,7 @@ def setup_argparse():
     Sets up the argument parser for the command line interface.
     """
     parser = argparse.ArgumentParser(description="Automates permission reviews by generating reports that highlight potential risks and inconsistencies.",
-                                     epilog="Example usage: python pa_permission_self_reviewer.py --path /path/to/analyze --config config.json")
+                                     epilog="Example usage: python3 main.py --path /path/to/analyze --config config.json")
 
     parser.add_argument("--path", required=True, help="The path to the directory or file to analyze.")
     parser.add_argument("--config", required=False, default="config.json", help="Path to the configuration file. Defaults to config.json")
@@ -201,7 +201,7 @@ def main():
 
 if __name__ == "__main__":
     # Example Usage
-    # python pa_permission_self_reviewer.py --path /path/to/analyze --config config.json --report output.txt
+    # python3 main.py --path /path/to/analyze --config config.json --report output.txt
     # Create a dummy config.json
     # cat > config.json <<EOL
     # {
